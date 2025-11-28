@@ -1,3 +1,14 @@
+//! This is an example file on how to use the rate limiter
+//! While setting a rate limit (3 requests per 5 seconds),
+//! we schedule 10 tasks simultaneously, which get executed
+//! by the rate limiter at the correct times.
+//!
+//! At the same time, we wait, independently of order of
+//! scheduling, for the tasks to finish.
+//!
+//! When the task finished, we print the received URL
+//! to get a nice doggo
+
 use std::time::Duration;
 
 use reqwest::Client;
@@ -32,8 +43,7 @@ async fn main() -> Result<(), ()> {
 		let client_clone = api_client.clone();
 		let (tx, rx) = oneshot::channel();
 		receivers.push(rx);
-		println!("Adding task {x}");
-		ritlers
+		let waiting_time = ritlers
 			.schedule_task(Box::new(move || {
 				Box::pin(async move {
 					println!("Starting to fetch task {x}");
@@ -43,6 +53,7 @@ async fn main() -> Result<(), ()> {
 				})
 			}))
 			.await;
+		println!("Scheduled task {x}, which will run in: {:?}", waiting_time);
 	}
 
 	// Wait for the 10 tasks to be done, independent of order
