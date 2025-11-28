@@ -22,6 +22,19 @@ use tokio::{
 
 type Task = Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>;
 
+/// Task-length aware rate limiter
+///
+/// # Example:
+/// ```rs
+/// // Limit 3 tasks per 5 seconds
+/// let ritlers = RateLimiter::new(3, Duration::from_secs(5));
+/// let schedule_wait_time = ritlers
+/// 	.schedule_task(Box::new(move || {
+/// 		Box::pin(async move {
+/// 			// Run task...
+/// 		})
+/// 	}));
+/// ```
 pub struct RateLimiter {
 	task_queue_sender: mpsc::Sender<Task>,
 	queued_tasks: Arc<AtomicUsize>,
@@ -31,6 +44,16 @@ pub struct RateLimiter {
 }
 
 impl RateLimiter {
+	/// Creates a new task-length aware rate limiter
+	///
+	/// `amount`: How many tasks run simultaneously \
+	/// `per_time`: Per how many seconds
+	///
+	/// # Example
+	///
+	/// ```rs
+	/// let limiter = RateLimiter::new(3, Duration::from_secs(4));
+	/// ```
 	pub fn new(amount: usize, per_time: Duration) -> Self {
 		// The semaphore indicates the maximum amount of concurrent tasks running
 		let semaphore = Arc::new(Semaphore::new(amount));
@@ -56,13 +79,15 @@ impl RateLimiter {
 		}
 	}
 
-	/// Runs all tasks queued
+	/// Runs all scheduled tasks.
+	/// Is thread blocking.
+	/// Will run indefinitely
 	async fn run_tasks(
 		mut task_receiver: mpsc::Receiver<Task>,
 		semaphore: Arc<Semaphore>,
 		interval: Duration,
 		queue_size: Arc<AtomicUsize>,
-	) {
+	) -> ! {
 		loop {
 			// First, wait for a task to execute
 			let task = task_receiver
@@ -95,8 +120,20 @@ impl RateLimiter {
 		}
 	}
 
-	/// Schedules the given task under the current rate limit
-	/// Returns the estimated waiting time
+	/// Schedules the given task. \
+	/// Returns the time until the task starts. \
+	/// Assumes all tasks are instant.
+	///
+	/// # Example
+	///
+	/// ```rs
+	/// let wait_time = rate_limiter
+	/// 	.schedule_task(Box::new(move || {
+	/// 		Box::pin(async move {
+	/// 			// Run task...
+	/// 		})
+	/// 	}));
+	/// ```
 	pub async fn schedule_task(&self, task: Task) -> Duration {
 		self.task_queue_sender
 			.send(task)
