@@ -22,3 +22,7 @@ ritlers.schedule_task(Box::new(move || {
 	})
 }));
 ```
+
+## Contribute
+
+Contributions are welcome. Feel free to open an issue or create a PR
