@@ -2,6 +2,15 @@
 name = "ritlers"
 version = "0.1.0"
 edition = "2024"
+description = "A task-length aware rate limiter"
+readme = "README.md"
+repository = "https://github.com/Florisheinen1/ritlers"
+license = "MIT OR Apache-2.0"
+keywords = ["rate-limiter", "rate-limit", "async"]
+categories = ["web-programming::http-client", "concurrency", "asynchronous"]
+
+[lints.rust]
+unsafe_code = "forbid"
 
 [dependencies]
 tokio = { version = "1.48.0", features = ["rt", "sync", "time"] }
