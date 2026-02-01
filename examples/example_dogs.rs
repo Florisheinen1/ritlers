@@ -1,23 +1,24 @@
-//! This is an example file on how to use the rate limiter
-//! While setting a rate limit (3 requests per 5 seconds),
-//! we schedule 10 tasks simultaneously, which get executed
-//! by the rate limiter at the correct times.
-//!
-//! At the same time, we wait, independently of order of
-//! scheduling, for the tasks to finish.
-//!
-//! When the task finished, we print the received URL
-//! to get a nice doggo
-
-use std::time::Duration;
+#![cfg(feature = "async")]
+use ritlers::async_rt::RateLimiter;
 
 use reqwest::Client;
-use ritlers::RateLimiter;
 use serde::Deserialize;
+use std::time::Duration;
 use tokio::{
 	self,
 	sync::oneshot::{self, Receiver, error::TryRecvError},
 };
+
+// //! This is an example file on how to use the rate limiter
+// //! While setting a rate limit (3 requests per 5 seconds),
+// //! we schedule 10 tasks simultaneously, which get executed
+// //! by the rate limiter at the correct times.
+// //!
+// //! At the same time, we wait, independently of order of
+// //! scheduling, for the tasks to finish.
+// //!
+// //! When the task finished, we print the received URL
+// //! to get a nice doggo
 
 // API endpoint to get randm dog photos
 const DOG_API_ENDPOINT: &'static str = "https://dog.ceo/api/breeds/image/random";
@@ -30,7 +31,8 @@ pub struct ApiResponse {
 #[tokio::main]
 async fn main() -> Result<(), ()> {
 	// Only 3 links per 5 seconds
-	let ritlers = RateLimiter::new(3, Duration::from_secs(5));
+	let ritlers =
+		RateLimiter::new(3, Duration::from_secs(5)).expect("Failed to create rate limiter");
 
 	let api_client = reqwest::ClientBuilder::new()
 		.build()
