@@ -9,7 +9,7 @@ use std::{
 };
 
 use tokio::{
-	sync::{Notify, Semaphore, mpsc},
+	sync::{Semaphore, mpsc},
 	time::sleep,
 };
 
@@ -31,10 +31,6 @@ type Task = Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>
 pub struct RateLimiter {
 	task_queue_sender: mpsc::Sender<Task>,
 	queued_tasks: Arc<AtomicUsize>,
-	/// Triggers each time the queue gets empty
-	/// Useful for waiting for all tasks to finish
-	notify_idle: Arc<Notify>,
-
 	amount: usize,
 	per_time: Duration,
 }
@@ -58,81 +54,60 @@ impl RateLimiter {
 		// The semaphore indicates the maximum amount of concurrent tasks running
 		let semaphore = Arc::new(Semaphore::new(amount));
 
-		// Create the send and receive end of the Tasks channel
 		let (sender, receiver) = mpsc::channel::<Task>(100);
 
 		// Keep track of the size of the queue for ETA calculations
 		let queue_size = Arc::new(AtomicUsize::new(0));
 		let queue_size_upper = queue_size.clone();
 
-		let notify_idle = Arc::new(Notify::new());
-		let notify_idle_clone = notify_idle.clone();
-
-		// Start running tasks
 		tokio::spawn(async move {
-			Self::run_tasks(
-				receiver,
-				semaphore,
-				per_time,
-				queue_size_upper,
-				notify_idle_clone,
-			)
-			.await;
+			Self::run_tasks(receiver, semaphore, per_time, queue_size_upper).await;
 		});
 
 		Ok(Self {
 			task_queue_sender: sender,
 			queued_tasks: queue_size,
-			notify_idle,
-
 			amount,
 			per_time,
 		})
 	}
 
 	/// Runs all scheduled tasks.
-	/// Is thread blocking.
-	/// Will run indefinitely
+	/// Thread blocking and runs indefinitely
 	async fn run_tasks(
 		mut task_receiver: mpsc::Receiver<Task>,
 		semaphore: Arc<Semaphore>,
 		interval: Duration,
 		queue_size: Arc<AtomicUsize>,
-		notify_idle: Arc<Notify>,
 	) -> ! {
 		loop {
-			// First, wait for a task to execute
 			let task = task_receiver
 				.recv()
 				.await
 				.expect("Failed to read task queue. Did the channel close?");
 
-			// Acquire a permit so we are allowed to *start* running a task
 			let permit = semaphore
 				.acquire()
 				.await
 				.expect("Failed to acquire semaphore permit. Did the semaphore close?");
-			// And forget it again. We add it exactly n seconds after the task is *done*
+
+			// New permit will be added again after the task is finished
 			permit.forget();
 
-			// Clone the semaphore Arc and queue size counter
 			let semaphore = semaphore.clone();
 			let counter = queue_size.clone();
-			let idle_notifier = notify_idle.clone();
 
+			// Run task itself on separate thread so we can immediately
+			// wait for new tasks
 			tokio::spawn(async move {
-				// Now, async run the task!
 				task().await;
 
-				// Sleep for 3 seconds, and then add a permit
+				// Sleep for `interval` time before adding a permit to ensure the
+				// rate limit is adhered to
 				sleep(interval).await;
 				semaphore.add_permits(1);
 
-				if counter.fetch_sub(1, Ordering::Relaxed) == 1 {
-					// This was the last task in the queue.
-					// Notify we are done!
-					idle_notifier.notify_one();
-				}
+				counter.fetch_sub(1, Ordering::Relaxed);
 			});
 		}
 	}
@@ -157,7 +132,6 @@ impl RateLimiter {
 			.await
 			.expect("Failed to schedule task. Did the channel close?");
 
-		// Add 1 to the queue counter
 		let position_in_queue = self.queued_tasks.fetch_add(1, Ordering::Relaxed);
 
 		let batches_ahead = position_in_queue / self.amount;
@@ -165,11 +139,6 @@ impl RateLimiter {
 		let estimated_waiting_time = self.per_time * batches_ahead as u32;
 
 		return estimated_waiting_time;
-	}
-
-	/// Waits until all tasks in the queue are executed
-	pub async fn wait_until_idle(&self) {
-		self.notify_idle.notified().await
 	}
 }
 
@@ -181,7 +150,10 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_creation_parameters() {
-		assert!(RateLimiter::new(0, Duration::from_secs(1)).is_err());
+		assert!(
+			RateLimiter::new(0, Duration::from_secs(1)).is_err(),
+			"Zero tasks allowed concurrently is not allowed"
+		);
 		assert!(RateLimiter::new(1, Duration::from_secs(1)).is_ok());
 		assert!(RateLimiter::new(100, Duration::from_secs(1)).is_ok());
 	}
@@ -1184,7 +1156,11 @@ mod tests {
 			}))
 			.await;
 
-		assert_eq!(eta_1, Duration::from_millis(0));
+		assert_eq!(
+			eta_1,
+			Duration::from_millis(0),
+			"First task should start immediately"
+		);
 
 		let eta_2 = rate_limiter
 			.schedule_task(Box::new(|| {
@@ -1194,7 +1170,11 @@ mod tests {
 			}))
 			.await;
 
-		assert_eq!(eta_2, Duration::from_millis(0));
+		assert_eq!(
+			eta_2,
+			Duration::from_millis(0),
+			"Second task should start immediately"
+		);
 
 		let eta_3 = rate_limiter
 			.schedule_task(Box::new(|| {
@@ -1204,7 +1184,11 @@ mod tests {
 			}))
 			.await;
 
-		assert_eq!(eta_3, Duration::from_millis(0));
+		assert_eq!(
+			eta_3,
+			Duration::from_millis(0),
+			"Third task should start immediately"
+		);
 
 		let eta_4 = rate_limiter
 			.schedule_task(Box::new(|| {
@@ -1214,6 +1198,10 @@ mod tests {
 			}))
 			.await;
 
-		assert_eq!(eta_4, Duration::from_secs(3));
+		assert_eq!(
+			eta_4,
+			Duration::from_secs(3),
+			"Fourth task should start after at least 3 seconds"
+		);
 	}
 }

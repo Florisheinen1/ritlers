@@ -2,14 +2,11 @@
 use ritlers::async_rt::RateLimiter;
 
 use std::time::Duration;
-use tokio::{
-	self,
-	sync::oneshot::{self, Receiver, error::TryRecvError},
-};
+use tokio;
 
 #[tokio::main]
 async fn main() {
-	let mut ratelimiter = RateLimiter::new(2, Duration::from_secs(1)).unwrap();
+	let ratelimiter = RateLimiter::new(2, Duration::from_secs(1)).unwrap();
 	ratelimiter
 		.schedule_task(Box::new(move || {
 			Box::pin(async move {
@@ -39,6 +36,5 @@ async fn main() {
 		}))
 		.await;
 
-	// Wait until all tasks are done
-	ratelimiter.wait_until_idle().await;
+	tokio::time::sleep(Duration::from_secs(3)).await;
 }

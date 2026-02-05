@@ -17,28 +17,25 @@ impl RateLimiter {
 		})
 	}
 
-	/// Runs the given task,
-	/// by waiting the right amount of time
-	/// Returns time the task finished
+	/// Runs the given task.
+	/// Blocks the calling thread untill the task can perform
+	/// Returns the instant when the task finished
 	pub fn schedule_task<F>(&mut self, task: F) -> Instant
 	where
 		F: FnOnce(),
 	{
-		let oldest_finish_time = self.finish_times.pop().expect("No finish times available");
+		let oldest_finish_time = self.finish_times.pop().expect("At least one finish time");
 
 		let now = Instant::now();
 
-		// TODO: Checked add? Saturated?
 		let wait_until = oldest_finish_time + self.per_time;
 		let time_to_wait = wait_until.duration_since(now);
-		// TODO:
 		std::thread::sleep(time_to_wait);
 
-		// Perform the task
 		task();
 
-		// And update the finish_times!
 		let finished_at = Instant::now();
+		// Insert at beginning to stay ordered
 		self.finish_times.insert(0, finished_at);
 		finished_at
 	}
@@ -54,7 +51,10 @@ mod tests {
 	#[test]
 	fn test_parameter_correctness() {
 		// Test amount of tokens
-		assert!(RateLimiter::new(0, Duration::from_secs(1)).is_err());
+		assert!(
+			RateLimiter::new(0, Duration::from_secs(1)).is_err(),
+			"Zero tasks allowed is not possible"
+		);
 		assert!(RateLimiter::new(1, Duration::from_secs(1)).is_ok());
 		assert!(RateLimiter::new(2, Duration::from_secs(1)).is_ok());
 		assert!(RateLimiter::new(500, Duration::from_secs(1)).is_ok());
@@ -67,8 +67,15 @@ mod tests {
 	#[test]
 	fn test_initialization_finish_times() {
 		let rate_limiter_1 = RateLimiter::new(1, Duration::from_secs(1)).unwrap();
-		assert_eq!(rate_limiter_1.finish_times.len(), 1);
-		assert!(rate_limiter_1.finish_times.first().unwrap() < &Instant::now());
+		assert_eq!(
+			rate_limiter_1.finish_times.len(),
+			1,
+			"There should be exactly one default finish time"
+		);
+		assert!(
+			rate_limiter_1.finish_times.first().unwrap() < &Instant::now(),
+			"The initial finish time should be older than now"
+		);
 
 		let rate_limiter_10 = RateLimiter::new(10, Duration::from_secs(10)).unwrap();
 		assert_eq!(rate_limiter_10.finish_times.len(), 10);
