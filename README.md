@@ -14,13 +14,11 @@ This does mean scheduled tasks are precisely run less frequently than the rate l
 ```rs
 // Allow 2 tasks per 3 seconds
 let ritlers = RateLimiter::new(2, Duration::from_secs(3));
-ritlers.schedule_task(Box::new(move || {
-	Box::pin(async move {
-		// First task started
-		std::thread::sleep(Duration::from_secs(3));
-		// First task ended
-	})
-}));
+ritlers.schedule_task(async {
+	// First task started
+	std::thread::sleep(Duration::from_secs(3));
+	// First task ended
+});
 ```
 
 ## Contribute
