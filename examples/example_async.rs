@@ -8,32 +8,24 @@ use tokio;
 async fn main() {
 	let ratelimiter = RateLimiter::new(2, Duration::from_secs(1)).unwrap();
 	ratelimiter
-		.schedule_task(Box::new(move || {
-			Box::pin(async move {
-				println!("Task 1 executed immediately");
-			})
-		}))
+		.schedule_task(async {
+			println!("Task 1 executed immediately");
+		})
 		.await;
 	ratelimiter
-		.schedule_task(Box::new(move || {
-			Box::pin(async move {
-				println!("Task 2 executed immediately");
-			})
-		}))
+		.schedule_task(async {
+			println!("Task 2 executed immediately");
+		})
 		.await;
 	ratelimiter
-		.schedule_task(Box::new(move || {
-			Box::pin(async move {
-				println!("Task 3 had to wait a bit");
-			})
-		}))
+		.schedule_task(async {
+			println!("Task 3 had to wait a bit");
+		})
 		.await;
 	ratelimiter
-		.schedule_task(Box::new(move || {
-			Box::pin(async move {
-				println!("Task 4 can go immediately afterwards");
-			})
-		}))
+		.schedule_task(async {
+			println!("Task 4 can go immediately afterwards");
+		})
 		.await;
 
 	tokio::time::sleep(Duration::from_secs(3)).await;

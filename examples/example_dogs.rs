@@ -46,14 +46,12 @@ async fn main() -> Result<(), ()> {
 		let (tx, rx) = oneshot::channel();
 		receivers.push(rx);
 		let waiting_time = ritlers
-			.schedule_task(Box::new(move || {
-				Box::pin(async move {
-					println!("Starting to fetch task {x}");
-					let random_dog_url = fetch_random_dog_link(&client_clone).await;
-					println!("Fetched task {x}");
-					tx.send(random_dog_url).expect("Failed to send dog url");
-				})
-			}))
+			.schedule_task(async move {
+				println!("Starting to fetch task {x}");
+				let random_dog_url = fetch_random_dog_link(&client_clone).await;
+				println!("Fetched task {x}");
+				tx.send(random_dog_url).expect("Failed to send dog url");
+			})
 			.await;
 		println!("Scheduled task {x}, which will run in: {:?}", waiting_time);
 	}

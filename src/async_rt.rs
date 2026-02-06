@@ -22,11 +22,9 @@ type Task = Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>
 /// // Limit 3 tasks per 5 seconds
 /// let ritlers = RateLimiter::new(3, Duration::from_secs(5));
 /// let schedule_wait_time = ritlers
-/// 	.schedule_task(Box::new(move || {
-/// 		Box::pin(async move {
-/// 			// Run task...
-/// 		})
-/// 	}));
+/// 	.schedule_task(async {
+/// 		// Run task...
+/// 	}).await;
 /// ```
 pub struct RateLimiter {
 	task_queue_sender: mpsc::Sender<Task>,
@@ -120,13 +118,17 @@ impl RateLimiter {
 	///
 	/// ```rs
 	/// let wait_time = rate_limiter
-	/// 	.schedule_task(Box::new(move || {
-	/// 		Box::pin(async move {
-	/// 			// Run task...
-	/// 		})
-	/// 	}));
+	/// 	.schedule_task(async {
+	/// 		// Run task...
+	/// 	});
 	/// ```
-	pub async fn schedule_task(&self, task: Task) -> Duration {
+	pub async fn schedule_task<Fut>(&self, fut: Fut) -> Duration
+	where
+		Fut: Future<Output = ()> + Send + 'static,
+	{
+		let task: Task =
+			Box::new(move || Box::pin(fut) as Pin<Box<dyn Future<Output = ()> + Send>>);
+
 		self.task_queue_sender
 			.send(task)
 			.await
@@ -172,41 +174,35 @@ mod tests {
 
 		// Task 1
 		rate_limiter
-			.schedule_task(Box::new(|| {
-				Box::pin(async move {
-					*task_1_status.clone().lock_owned().await = 1;
+			.schedule_task(async move {
+				*task_1_status.clone().lock_owned().await = 1;
 
-					sleep(Duration::from_millis(200)).await;
+				sleep(Duration::from_millis(200)).await;
 
-					*task_1_status.clone().lock_owned().await = 2;
-				})
-			}))
+				*task_1_status.clone().lock_owned().await = 2;
+			})
 			.await;
 
 		// Task 2
 		rate_limiter
-			.schedule_task(Box::new(|| {
-				Box::pin(async move {
-					*task_2_status.clone().lock_owned().await = 1;
+			.schedule_task(async move {
+				*task_2_status.clone().lock_owned().await = 1;
 
-					sleep(Duration::from_millis(200)).await;
+				sleep(Duration::from_millis(200)).await;
 
-					*task_2_status.clone().lock_owned().await = 2;
-				})
-			}))
+				*task_2_status.clone().lock_owned().await = 2;
+			})
 			.await;
 
 		// Task 3
 		rate_limiter
-			.schedule_task(Box::new(|| {
-				Box::pin(async move {
-					*task_3_status.clone().lock_owned().await = 1;
+			.schedule_task(async move {
+				*task_3_status.clone().lock_owned().await = 1;
 
-					sleep(Duration::from_millis(200)).await;
+				sleep(Duration::from_millis(200)).await;
 
-					*task_3_status.clone().lock_owned().await = 2;
-				})
-			}))
+				*task_3_status.clone().lock_owned().await = 2;
+			})
 			.await;
 
 		// TASK TIMINGS
@@ -518,41 +514,35 @@ mod tests {
 
 		// Task 1
 		rate_limiter
-			.schedule_task(Box::new(|| {
-				Box::pin(async move {
-					*task_1_status.clone().lock_owned().await = 1;
+			.schedule_task(async move {
+				*task_1_status.clone().lock_owned().await = 1;
 
-					sleep(Duration::from_millis(2000)).await;
+				sleep(Duration::from_millis(2000)).await;
 
-					*task_1_status.clone().lock_owned().await = 2;
-				})
-			}))
+				*task_1_status.clone().lock_owned().await = 2;
+			})
 			.await;
 
 		// Task 2
 		rate_limiter
-			.schedule_task(Box::new(|| {
-				Box::pin(async move {
-					*task_2_status.clone().lock_owned().await = 1;
+			.schedule_task(async move {
+				*task_2_status.clone().lock_owned().await = 1;
 
-					sleep(Duration::from_millis(2000)).await;
+				sleep(Duration::from_millis(2000)).await;
 
-					*task_2_status.clone().lock_owned().await = 2;
-				})
-			}))
+				*task_2_status.clone().lock_owned().await = 2;
+			})
 			.await;
 
 		// Task 3
 		rate_limiter
-			.schedule_task(Box::new(|| {
-				Box::pin(async move {
-					*task_3_status.clone().lock_owned().await = 1;
+			.schedule_task(async move {
+				*task_3_status.clone().lock_owned().await = 1;
 
-					sleep(Duration::from_millis(2000)).await;
+				sleep(Duration::from_millis(2000)).await;
 
-					*task_3_status.clone().lock_owned().await = 2;
-				})
-			}))
+				*task_3_status.clone().lock_owned().await = 2;
+			})
 			.await;
 
 		// TASK TIMINGS
@@ -798,68 +788,56 @@ mod tests {
 
 		// Task 1
 		rate_limiter
-			.schedule_task(Box::new(|| {
-				Box::pin(async move {
-					*task_1_status.clone().lock_owned().await = 1;
-					sleep(Duration::from_millis(100)).await;
-					*task_1_status.clone().lock_owned().await = 2;
-				})
-			}))
+			.schedule_task(async move {
+				*task_1_status.clone().lock_owned().await = 1;
+				sleep(Duration::from_millis(100)).await;
+				*task_1_status.clone().lock_owned().await = 2;
+			})
 			.await;
 
 		// Task 2
 		rate_limiter
-			.schedule_task(Box::new(|| {
-				Box::pin(async move {
-					*task_2_status.clone().lock_owned().await = 1;
-					sleep(Duration::from_millis(4000)).await;
-					*task_2_status.clone().lock_owned().await = 2;
-				})
-			}))
+			.schedule_task(async move {
+				*task_2_status.clone().lock_owned().await = 1;
+				sleep(Duration::from_millis(4000)).await;
+				*task_2_status.clone().lock_owned().await = 2;
+			})
 			.await;
 
 		// Task 3
 		rate_limiter
-			.schedule_task(Box::new(|| {
-				Box::pin(async move {
-					*task_3_status.clone().lock_owned().await = 1;
-					sleep(Duration::from_millis(100)).await;
-					*task_3_status.clone().lock_owned().await = 2;
-				})
-			}))
+			.schedule_task(async move {
+				*task_3_status.clone().lock_owned().await = 1;
+				sleep(Duration::from_millis(100)).await;
+				*task_3_status.clone().lock_owned().await = 2;
+			})
 			.await;
 
 		// Task 4
 		rate_limiter
-			.schedule_task(Box::new(|| {
-				Box::pin(async move {
-					*task_4_status.clone().lock_owned().await = 1;
-					sleep(Duration::from_millis(100)).await;
-					*task_4_status.clone().lock_owned().await = 2;
-				})
-			}))
+			.schedule_task(async move {
+				*task_4_status.clone().lock_owned().await = 1;
+				sleep(Duration::from_millis(100)).await;
+				*task_4_status.clone().lock_owned().await = 2;
+			})
 			.await;
 
 		// Task 5
 		rate_limiter
-			.schedule_task(Box::new(|| {
-				Box::pin(async move {
-					*task_5_status.clone().lock_owned().await = 1;
-					sleep(Duration::from_millis(100)).await;
-					*task_5_status.clone().lock_owned().await = 2;
-				})
-			}))
+			.schedule_task(async move {
+				*task_5_status.clone().lock_owned().await = 1;
+				sleep(Duration::from_millis(100)).await;
+				*task_5_status.clone().lock_owned().await = 2;
+			})
 			.await;
 
 		// Task 6
 		rate_limiter
-			.schedule_task(Box::new(|| {
-				Box::pin(async move {
-					*task_6_status.clone().lock_owned().await = 1;
-					sleep(Duration::from_millis(100)).await;
-					*task_6_status.clone().lock_owned().await = 2;
-				})
-			}))
+			.schedule_task(async move {
+				*task_6_status.clone().lock_owned().await = 1;
+				sleep(Duration::from_millis(100)).await;
+				*task_6_status.clone().lock_owned().await = 2;
+			})
 			.await;
 
 		// TASK TIMINGS
@@ -1149,11 +1127,9 @@ mod tests {
 		tokio::time::pause();
 
 		let eta_1 = rate_limiter
-			.schedule_task(Box::new(|| {
-				Box::pin(async move {
-					sleep(Duration::from_millis(10)).await;
-				})
-			}))
+			.schedule_task(async {
+				sleep(Duration::from_millis(10)).await;
+			})
 			.await;
 
 		assert_eq!(
@@ -1163,11 +1139,9 @@ mod tests {
 		);
 
 		let eta_2 = rate_limiter
-			.schedule_task(Box::new(|| {
-				Box::pin(async move {
-					sleep(Duration::from_millis(10)).await;
-				})
-			}))
+			.schedule_task(async {
+				sleep(Duration::from_millis(10)).await;
+			})
 			.await;
 
 		assert_eq!(
@@ -1177,11 +1151,9 @@ mod tests {
 		);
 
 		let eta_3 = rate_limiter
-			.schedule_task(Box::new(|| {
-				Box::pin(async move {
-					sleep(Duration::from_millis(10)).await;
-				})
-			}))
+			.schedule_task(async {
+				sleep(Duration::from_millis(10)).await;
+			})
 			.await;
 
 		assert_eq!(
@@ -1191,11 +1163,9 @@ mod tests {
 		);
 
 		let eta_4 = rate_limiter
-			.schedule_task(Box::new(|| {
-				Box::pin(async move {
-					sleep(Duration::from_millis(10)).await;
-				})
-			}))
+			.schedule_task(async {
+				sleep(Duration::from_millis(10)).await;
+			})
 			.await;
 
 		assert_eq!(
