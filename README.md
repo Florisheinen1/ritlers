@@ -1,26 +1,70 @@
-# RITLERS
+# Ritlers
 
-A task-length aware rate limiter, made in Rust.
-Useful for calling APIs that apply strict rate limiting.
+A task-length aware rate limiter for Rust, useful for calling APIs that apply strict rate limiting.
 
-## Difference from other rate limiters
+## Why ritlers?
 
-Most other rate limiters limit the start of each provided task. Unfortunately, due to network routing inconsistencies, even when requests are periodically sent conforming the rate limit, too many requests might still end up at the endpoint simultaneously. Ritlers therefore waits until the provided tasks are "done" (E.g. received a response) before rate limit time continues.
+Most rate limiters count when a task *starts*. Because network requests have variable latency, this can still cause bursts to arrive at a downstream server simultaneously. Ritlers instead waits for each task to *finish* before its slot becomes available again, so the rate limit is respected regardless of how long individual requests take.
 
-This does mean scheduled tasks are precisely run less frequently than the rate limit requires by the amount of time the tasks require to run. When tasks are finished instantly, this rate limiter exactly matches behavior of any other token-bucket rate limiter.
+When tasks complete instantly the behaviour is identical to a standard token-bucket limiter.
 
-## Example of code
+## Features
 
-```rs
-// Allow 2 tasks per 3 seconds
-let ritlers = RateLimiter::new(2, Duration::from_secs(3));
-ritlers.schedule_task(async {
-	// First task started
-	std::thread::sleep(Duration::from_secs(3));
-	// First task ended
+- **Blocking** (`blocking` — default): parks the calling thread until a slot is free
+- **Async** (`async`): non-blocking, backed by Tokio
+- **Retry support**: return `TaskResult::TryAgain` from a task to re-queue it at the front of the queue
+
+## Usage
+
+### Blocking
+
+```rust
+use std::time::Duration;
+use ritlers::blocking::RateLimiter;
+use ritlers::TaskResult;
+
+// 2 requests per second
+let mut limiter = RateLimiter::new(2, Duration::from_secs(1)).unwrap();
+
+limiter.schedule_task(|| {
+    // perform API call
 });
+
+// Retry automatically on rate-limit errors
+limiter.schedule_task_with_retry(|| {
+    match do_api_call() {
+        Ok(_)  => TaskResult::Success,
+        Err(_) => TaskResult::TryAgain,
+    }
+});
+```
+
+### Async
+
+```rust
+use std::time::Duration;
+use ritlers::async_rt::RateLimiter;
+use ritlers::TaskResult;
+
+#[tokio::main]
+async fn main() {
+    // 2 requests per second
+    let limiter = RateLimiter::new(2, Duration::from_secs(1)).unwrap();
+
+    limiter.schedule_task(async {
+        // perform API call
+    }).await;
+
+    // Retry automatically on rate-limit errors
+    limiter.schedule_task_with_retry(|| async {
+        match do_api_call().await {
+            Ok(_)  => TaskResult::Success,
+            Err(_) => TaskResult::TryAgain,
+        }
+    }).await;
+}
 ```
 
 ## Contribute
 
-Contributions are welcome. Feel free to open an issue or create a PR
+Contributions are welcome. Feel free to open an issue or create a PR.

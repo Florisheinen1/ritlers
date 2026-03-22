@@ -17,16 +17,31 @@ use crate::TaskResult;
 
 type Task = Arc<dyn Fn() -> Pin<Box<dyn Future<Output = TaskResult> + Send>> + Send + Sync>;
 
-/// Task-length aware rate limiter
+/// An async, task-length aware rate limiter backed by Tokio.
 ///
-/// # Example:
-/// ```rs
-/// // Limit 3 tasks per 5 seconds
-/// let ritlers = RateLimiter::new(3, Duration::from_secs(5));
-/// let schedule_wait_time = ritlers
-/// 	.schedule_task(async {
-/// 		// Run task...
-/// 	}).await;
+/// Schedules futures through an internal queue. A slot is only released after
+/// a task *finishes* and a full `per_time` interval has elapsed, ensuring
+/// downstream services never receive more concurrent requests than `amount`
+/// within any window.
+///
+/// Internally, `new` spawns a long-lived Tokio task that drives the queue.
+/// The `RateLimiter` handle itself is cheap to clone — `schedule_task` and
+/// `schedule_task_with_retry` both take `&self`.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use std::time::Duration;
+/// use ritlers::async_rt::RateLimiter;
+///
+/// # #[tokio::main]
+/// # async fn main() {
+/// // Allow up to 3 requests per 5 seconds
+/// let limiter = RateLimiter::new(3, Duration::from_secs(5)).unwrap();
+/// let estimated_wait = limiter.schedule_task(async {
+///     // perform API call
+/// }).await;
+/// # }
 /// ```
 pub struct RateLimiter {
 	task_queue_sender: mpsc::Sender<Task>,
@@ -36,15 +51,25 @@ pub struct RateLimiter {
 }
 
 impl RateLimiter {
-	/// Creates a new task-length aware rate limiter
+	/// Creates a new rate limiter that allows `amount` tasks per `per_time`.
 	///
-	/// `amount`: How many tasks run simultaneously \
-	/// `per_time`: Per how many seconds
+	/// Spawns an internal Tokio task to drive the queue — must be called from
+	/// within a Tokio runtime.
+	///
+	/// # Errors
+	///
+	/// Returns `Err(())` if `amount` is zero.
 	///
 	/// # Example
 	///
-	/// ```rs
-	/// let limiter = RateLimiter::new(3, Duration::from_secs(4));
+	/// ```rust,no_run
+	/// use std::time::Duration;
+	/// use ritlers::async_rt::RateLimiter;
+	///
+	/// # #[tokio::main]
+	/// # async fn main() {
+	/// let limiter = RateLimiter::new(5, Duration::from_secs(1)).unwrap();
+	/// # }
 	/// ```
 	pub fn new(amount: usize, per_time: Duration) -> Result<Self, ()> {
 		if amount == 0 {
@@ -82,8 +107,7 @@ impl RateLimiter {
 		})
 	}
 
-	/// Runs all scheduled tasks.
-	/// Thread blocking and runs indefinitely
+	/// Internal loop that drives the task queue. Runs indefinitely.
 	async fn run_tasks(
 		mut task_receiver: mpsc::Receiver<Task>,
 		mut retry_receiver: mpsc::Receiver<Task>,
@@ -138,17 +162,23 @@ impl RateLimiter {
 		}
 	}
 
-	/// Schedules the given task. \
-	/// Returns the time until the task starts. \
-	/// Assumes all tasks are instant.
+	/// Schedules a task and returns the estimated time until it starts.
+	///
+	/// The estimate assumes all currently queued tasks complete instantly; use
+	/// it for informational purposes only.
 	///
 	/// # Example
 	///
-	/// ```rs
-	/// let wait_time = rate_limiter
-	/// 	.schedule_task(async {
-	/// 		// Run task...
-	/// 	});
+	/// ```rust,no_run
+	/// # use std::time::Duration;
+	/// # use ritlers::async_rt::RateLimiter;
+	/// # #[tokio::main]
+	/// # async fn main() {
+	/// # let rate_limiter = RateLimiter::new(1, Duration::from_secs(1)).unwrap();
+	/// let estimated_wait = rate_limiter.schedule_task(async {
+	///     // perform API call
+	/// }).await;
+	/// # }
 	/// ```
 	pub async fn schedule_task<Fut>(&self, fut: Fut) -> Duration
 	where
@@ -179,21 +209,34 @@ impl RateLimiter {
 		self.per_time * batches_ahead as u32
 	}
 
-	/// Schedules a retryable task using a factory closure. \
-	/// The factory is called each time the task runs. If it returns
-	/// [`TaskResult::TryAgain`], the task is re-queued and will run again
-	/// as soon as the next rate-limit slot is available. \
-	/// Returns the estimated time until the first attempt starts.
+	/// Schedules a retryable task and returns the estimated time until the
+	/// first attempt starts.
+	///
+	/// `factory` is called once per attempt. When it returns
+	/// [`TaskResult::TryAgain`], the task is placed at the front of the queue
+	/// and re-run as soon as the next slot is free. Retried tasks are
+	/// prioritised over newly scheduled tasks.
+	///
+	/// Because the factory may be called multiple times it must implement
+	/// [`Fn`] (not [`FnOnce`]). Capture any mutable state in an
+	/// `Arc<Mutex<_>>`.
 	///
 	/// # Example
 	///
-	/// ```rs
+	/// ```rust,no_run
+	/// # use std::time::Duration;
+	/// # use ritlers::{async_rt::RateLimiter, TaskResult};
+	/// # #[tokio::main]
+	/// # async fn main() {
+	/// # let rate_limiter = RateLimiter::new(1, Duration::from_secs(1)).unwrap();
 	/// rate_limiter.schedule_task_with_retry(|| async {
-	/// 	match api_call().await {
-	/// 		Ok(_) => TaskResult::Success,
-	/// 		Err(ApiError::RateLimit) => TaskResult::TryAgain,
-	/// 	}
+	///     match do_api_call().await {
+	///         Ok(_)  => TaskResult::Success,
+	///         Err(_) => TaskResult::TryAgain,
+	///     }
 	/// }).await;
+	/// # async fn do_api_call() -> Result<(), ()> { Ok(()) }
+	/// # }
 	/// ```
 	pub async fn schedule_task_with_retry<F, Fut>(&self, factory: F) -> Duration
 	where

@@ -2,15 +2,45 @@ use std::time::{Duration, Instant};
 
 use crate::TaskResult;
 
+/// A synchronous, task-length aware rate limiter.
+///
+/// Schedules tasks one at a time on the calling thread, blocking until a
+/// rate-limit slot is free before each execution. The slot is only released
+/// after the task *finishes*, ensuring downstream services never receive more
+/// concurrent requests than `amount` within any `per_time` window.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use std::time::Duration;
+/// use ritlers::blocking::RateLimiter;
+///
+/// // Allow up to 2 requests per second
+/// let mut limiter = RateLimiter::new(2, Duration::from_secs(1)).unwrap();
+/// limiter.schedule_task(|| { /* perform API call */ });
+/// ```
 pub struct RateLimiter {
-	finish_times: Vec<Instant>, // Sorted (old -> recent) list of finish times
+	finish_times: Vec<Instant>, // Sorted oldest-first list of task finish times
 	per_time: Duration,
 }
 
 impl RateLimiter {
+	/// Creates a new rate limiter that allows `amount` tasks per `per_time`.
+	///
+	/// # Errors
+	///
+	/// Returns `Err(())` if `amount` is zero.
+	///
+	/// # Example
+	///
+	/// ```rust
+	/// use std::time::Duration;
+	/// use ritlers::blocking::RateLimiter;
+	///
+	/// let limiter = RateLimiter::new(5, Duration::from_secs(1)).unwrap();
+	/// ```
 	pub fn new(amount: usize, per_time: Duration) -> Result<Self, ()> {
 		if amount == 0 {
-			// Invalid amount of requests per time. Needs to be >= 1
 			return Err(());
 		}
 		Ok(Self {
@@ -19,9 +49,21 @@ impl RateLimiter {
 		})
 	}
 
-	/// Runs the given task.
-	/// Blocks the calling thread untill the task can perform
-	/// Returns the instant when the task finished
+	/// Runs the given task, blocking the calling thread until a rate-limit slot
+	/// is available.
+	///
+	/// Returns the [`Instant`] when the task finished.
+	///
+	/// # Example
+	///
+	/// ```rust,no_run
+	/// # use std::time::Duration;
+	/// # use ritlers::blocking::RateLimiter;
+	/// # let mut rate_limiter = RateLimiter::new(1, Duration::from_secs(1)).unwrap();
+	/// let finished_at = rate_limiter.schedule_task(|| {
+	///     // perform API call
+	/// });
+	/// ```
 	pub fn schedule_task<F>(&mut self, task: F) -> Instant
 	where
 		F: FnOnce(),
@@ -37,14 +79,34 @@ impl RateLimiter {
 		task();
 
 		let finished_at = Instant::now();
-		// Insert at beginning to stay ordered
+		// Insert at the front to keep the list sorted oldest-first
 		self.finish_times.insert(0, finished_at);
 		finished_at
 	}
-	/// Runs the given task, retrying it (respecting the rate limit each time)
-	/// until the task returns [`TaskResult::Success`].
-	/// Blocks the calling thread until the task succeeds.
-	/// Returns the instant when the final (successful) attempt finished.
+
+	/// Runs the given task, retrying it after each rate-limit interval until it
+	/// returns [`TaskResult::Success`].
+	///
+	/// Each attempt — including retries — must wait for an available slot, so
+	/// the rate limit is respected throughout. Blocks the calling thread until
+	/// the task succeeds.
+	///
+	/// Returns the [`Instant`] when the final successful attempt finished.
+	///
+	/// # Example
+	///
+	/// ```rust,no_run
+	/// # use std::time::Duration;
+	/// # use ritlers::{blocking::RateLimiter, TaskResult};
+	/// # let mut rate_limiter = RateLimiter::new(1, Duration::from_secs(1)).unwrap();
+	/// rate_limiter.schedule_task_with_retry(|| {
+	///     match do_api_call() {
+	///         Ok(_)  => TaskResult::Success,
+	///         Err(_) => TaskResult::TryAgain,
+	///     }
+	/// });
+	/// # fn do_api_call() -> Result<(), ()> { Ok(()) }
+	/// ```
 	pub fn schedule_task_with_retry<F>(&mut self, mut task: F) -> Instant
 	where
 		F: FnMut() -> TaskResult,
@@ -81,7 +143,6 @@ mod tests {
 
 	#[test]
 	fn test_parameter_correctness() {
-		// Test amount of tokens
 		assert!(
 			RateLimiter::new(0, Duration::from_secs(1)).is_err(),
 			"Zero tasks allowed is not possible"
@@ -89,10 +150,9 @@ mod tests {
 		assert!(RateLimiter::new(1, Duration::from_secs(1)).is_ok());
 		assert!(RateLimiter::new(2, Duration::from_secs(1)).is_ok());
 		assert!(RateLimiter::new(500, Duration::from_secs(1)).is_ok());
-		// Test duration
-		assert!(RateLimiter::new(1, Duration::ZERO).is_ok()); // Essentially no limit
+		assert!(RateLimiter::new(1, Duration::ZERO).is_ok());
 		assert!(RateLimiter::new(1, Duration::from_secs(500)).is_ok());
-		assert!(RateLimiter::new(1, Duration::MAX).is_ok()); // Allows only single task ever
+		assert!(RateLimiter::new(1, Duration::MAX).is_ok());
 	}
 
 	#[test]
@@ -143,10 +203,10 @@ mod tests {
 		let finished_2 = rate_limiter.schedule_task(|| {});
 		let finished_3 = rate_limiter.schedule_task(|| {});
 		let finished_4 = rate_limiter.schedule_task(|| {});
-		// Both task 2 and 3 should be done instantly after task 1
+		// Tasks 2 and 3 share the initial burst, so they finish close to task 1
 		assert!(finished_2.duration_since(finished_1) < Duration::from_secs(1));
 		assert!(finished_3.duration_since(finished_1) < Duration::from_secs(1));
-		// Task 4 however needs to wait for the time to elapse since task 1
+		// Task 4 must wait for the window opened by task 1 to expire
 		assert!(finished_1 + Duration::from_secs(1) < finished_4);
 	}
 
