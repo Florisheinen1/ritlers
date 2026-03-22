@@ -33,7 +33,6 @@ pub struct RateLimiter {
 	queued_tasks: Arc<AtomicUsize>,
 	amount: usize,
 	per_time: Duration,
-	retry_queue_sender: mpsc::Sender<Task>,
 }
 
 impl RateLimiter {
@@ -80,7 +79,6 @@ impl RateLimiter {
 			queued_tasks: queue_size,
 			amount,
 			per_time,
-			retry_queue_sender: retry_sender,
 		})
 	}
 
@@ -95,14 +93,6 @@ impl RateLimiter {
 		queue_size: Arc<AtomicUsize>,
 	) -> ! {
 		loop {
-			// Prefer retried tasks over newly scheduled ones so they jump the queue
-			let task = tokio::select! {
-				biased;
-				Some(t) = retry_receiver.recv() => t,
-				Some(t) = task_receiver.recv() => t,
-				else => panic!("Task queue closed unexpectedly"),
-			};
-
 			let permit = semaphore
 				.acquire()
 				.await
@@ -110,6 +100,15 @@ impl RateLimiter {
 
 			// New permit will be added again after the task is finished
 			permit.forget();
+
+			// Only dequeue once a slot is free, so the biased select can
+			// actually prefer retried tasks over newly scheduled ones
+			let task = tokio::select! {
+				biased;
+				Some(t) = retry_receiver.recv() => t,
+				Some(t) = task_receiver.recv() => t,
+				else => panic!("Task queue closed unexpectedly"),
+			};
 
 			let semaphore = semaphore.clone();
 			let counter = queue_size.clone();
@@ -1252,21 +1251,39 @@ mod tests {
 		);
 	}
 
-	#[tokio::test]
-	async fn test_retry() {
-		let rate_limiter = RateLimiter::new(1, Duration::from_millis(50)).unwrap();
-		let attempt_count = Arc::new(AtomicUsize::new(0));
-		let attempt_count_check = attempt_count.clone();
+	// Each helper creates the standard "attempt counter + succeeded flag" shared
+	// state used across the retry tests.
+	fn make_retry_state() -> (
+		Arc<Mutex<u32>>,
+		Arc<Mutex<u32>>,
+		Arc<Mutex<bool>>,
+		Arc<Mutex<bool>>,
+	) {
+		let attempts = Arc::new(Mutex::new(0u32));
+		let attempts_check = attempts.clone();
 		let succeeded = Arc::new(Mutex::new(false));
 		let succeeded_check = succeeded.clone();
+		(attempts, attempts_check, succeeded, succeeded_check)
+	}
 
+	/// Verifies that a task that keeps returning TryAgain is re-run after each
+	/// rate-limit interval and eventually completes once it returns Success.
+	#[tokio::test]
+	async fn test_retry_reruns_task() {
+		let rate_limiter = RateLimiter::new(1, Duration::from_millis(100)).unwrap();
+		let (attempts, attempts_check, succeeded, succeeded_check) = make_retry_state();
+
+		tokio::time::pause();
+
+		// TryAgain on attempts 1 and 2, Success on attempt 3
 		rate_limiter
 			.schedule_task_with_retry(move || {
-				let count = attempt_count.clone();
+				let attempts = attempts.clone();
 				let succeeded = succeeded.clone();
 				async move {
-					let n = count.fetch_add(1, Ordering::Relaxed) + 1;
-					if n < 3 {
+					let mut n = attempts.lock().await;
+					*n += 1;
+					if *n < 3 {
 						TaskResult::TryAgain
 					} else {
 						*succeeded.lock().await = true;
@@ -1276,14 +1293,83 @@ mod tests {
 			})
 			.await;
 
-		// Allow all retry attempts to complete (3 attempts * 50ms interval)
-		tokio::time::sleep(Duration::from_millis(300)).await;
+		// First attempt
+		tokio::task::yield_now().await;
+		assert_eq!(*attempts_check.lock().await, 1, "first attempt should have run");
+		assert!(!*succeeded_check.lock().await);
 
-		assert_eq!(
-			attempt_count_check.load(Ordering::Relaxed),
-			3,
-			"Should have attempted 3 times (2 retries)"
+		// Advance past the interval to trigger the first retry
+		tokio::time::advance(Duration::from_millis(101)).await;
+		tokio::task::yield_now().await;
+		assert_eq!(*attempts_check.lock().await, 2, "second attempt should have run");
+		assert!(!*succeeded_check.lock().await);
+
+		// Advance past the interval to trigger the second (final) retry
+		tokio::time::advance(Duration::from_millis(101)).await;
+		tokio::task::yield_now().await;
+		assert_eq!(*attempts_check.lock().await, 3, "third attempt should have run");
+		assert!(*succeeded_check.lock().await, "task should have succeeded on attempt 3");
+	}
+
+	/// Verifies that a retried task takes priority over a newly scheduled task
+	/// that is waiting in the normal task queue.
+	#[tokio::test]
+	async fn test_retry_jumps_queue() {
+		// One slot, 1-second window
+		let rate_limiter = RateLimiter::new(1, Duration::from_secs(1)).unwrap();
+		let (task_a_attempts, task_a_attempts_check, _, _) = make_retry_state();
+		let task_b_started = Arc::new(Mutex::new(false));
+		let task_b_started_check = task_b_started.clone();
+
+		tokio::time::pause();
+
+		// Task A: TryAgain on first attempt, Success on second
+		rate_limiter
+			.schedule_task_with_retry({
+				let attempts = task_a_attempts.clone();
+				move || {
+					let attempts = attempts.clone();
+					async move {
+						let mut n = attempts.lock().await;
+						*n += 1;
+						if *n == 1 {
+							TaskResult::TryAgain
+						} else {
+							TaskResult::Success
+						}
+					}
+				}
+			})
+			.await;
+
+		// Task B: a plain task queued after A
+		rate_limiter
+			.schedule_task(async move {
+				*task_b_started.lock().await = true;
+			})
+			.await;
+
+		// Let run_tasks pick up task A (the only available slot)
+		tokio::task::yield_now().await;
+		assert_eq!(*task_a_attempts_check.lock().await, 1, "A: first attempt");
+		assert!(!*task_b_started_check.lock().await, "B should not have started yet");
+
+		// Advance past the interval: A's interval sleep completes, A is re-queued
+		// to the retry channel, and run_tasks acquires the new permit
+		tokio::time::advance(Duration::from_millis(1001)).await;
+		tokio::task::yield_now().await;
+
+		// The biased select must have chosen A from the retry channel over B from
+		// the task channel
+		assert_eq!(*task_a_attempts_check.lock().await, 2, "A: retry ran before B");
+		assert!(
+			!*task_b_started_check.lock().await,
+			"B should still not have started — A's retry took the slot"
 		);
-		assert!(*succeeded_check.lock().await, "Task should have succeeded");
+
+		// Advance past A's second interval: now B is the only queued task
+		tokio::time::advance(Duration::from_millis(1001)).await;
+		tokio::task::yield_now().await;
+		assert!(*task_b_started_check.lock().await, "B should now have started");
 	}
 }

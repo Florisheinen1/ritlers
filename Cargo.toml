@@ -21,7 +21,7 @@ blocking = []
 async = ["dep:tokio"]
 
 [dependencies]
-tokio = { version = "1.48.0", optional = true, features = ["rt", "sync", "time"] }
+tokio = { version = "1.48.0", optional = true, features = ["rt", "sync", "time", "macros"] }
 
 [dev-dependencies]
 reqwest = "0.12.24"
@@ -34,4 +34,7 @@ name = "example_async"
 required-features = ["async"]
 [[example]]
 name = "example_dogs"
+required-features = ["async"]
+[[example]]
+name = "example_retry_async"
 required-features = ["async"]
