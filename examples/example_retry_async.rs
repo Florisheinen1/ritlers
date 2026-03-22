@@ -25,7 +25,7 @@ async fn main() {
 		let retries_remaining = Arc::new(Mutex::new(3u32));
 		let attempt = Arc::new(Mutex::new(0u32));
 
-		rate_limiter
+		let eta = rate_limiter
 			.schedule_task_with_retry(move || {
 				let retries_remaining = retries_remaining.clone();
 				let attempt = attempt.clone();
@@ -37,7 +37,7 @@ async fn main() {
 					match simulated_api_call(current_attempt).await {
 						Ok(response) => {
 							println!("[task {task_id}] {response}");
-							TaskResult::Success
+							TaskResult::Done
 						}
 						Err(e) => {
 							let mut retries = retries_remaining.lock().await;
@@ -50,13 +50,14 @@ async fn main() {
 								TaskResult::TryAgain
 							} else {
 								println!("[task {task_id}] {e} — giving up");
-								TaskResult::Success
+								TaskResult::Done
 							}
 						}
 					}
 				}
 			})
 			.await;
+		println!("[task {task_id}] scheduled, estimated wait: {eta:.1?}");
 	}
 
 	// Wait for all scheduled tasks (including retries) to finish

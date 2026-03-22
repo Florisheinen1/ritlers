@@ -13,7 +13,7 @@ use tokio::{
 	time::sleep,
 };
 
-use crate::TaskResult;
+use crate::{TaskResult, ZeroAmountError};
 
 type Task = Arc<dyn Fn() -> Pin<Box<dyn Future<Output = TaskResult> + Send>> + Send + Sync>;
 
@@ -25,8 +25,8 @@ type Task = Arc<dyn Fn() -> Pin<Box<dyn Future<Output = TaskResult> + Send>> + S
 /// within any window.
 ///
 /// Internally, `new` spawns a long-lived Tokio task that drives the queue.
-/// The `RateLimiter` handle itself is cheap to clone — `schedule_task` and
-/// `schedule_task_with_retry` both take `&self`.
+/// `RateLimiter` implements `Clone` — clones share the same queue and rate
+/// limit, making it easy to pass handles across tasks without an extra `Arc`.
 ///
 /// # Example
 ///
@@ -43,6 +43,7 @@ type Task = Arc<dyn Fn() -> Pin<Box<dyn Future<Output = TaskResult> + Send>> + S
 /// }).await;
 /// # }
 /// ```
+#[derive(Clone)]
 pub struct RateLimiter {
 	task_queue_sender: mpsc::Sender<Task>,
 	queued_tasks: Arc<AtomicUsize>,
@@ -58,7 +59,7 @@ impl RateLimiter {
 	///
 	/// # Errors
 	///
-	/// Returns `Err(())` if `amount` is zero.
+	/// Returns [`Err(ZeroAmountError)`](ZeroAmountError) if `amount` is zero.
 	///
 	/// # Example
 	///
@@ -71,12 +72,11 @@ impl RateLimiter {
 	/// let limiter = RateLimiter::new(5, Duration::from_secs(1)).unwrap();
 	/// # }
 	/// ```
-	pub fn new(amount: usize, per_time: Duration) -> Result<Self, ()> {
+	pub fn new(amount: usize, per_time: Duration) -> Result<Self, ZeroAmountError> {
 		if amount == 0 {
-			return Err(());
+			return Err(ZeroAmountError);
 		}
 
-		// The semaphore indicates the maximum amount of concurrent tasks running
 		let semaphore = Arc::new(Semaphore::new(amount));
 
 		let (sender, receiver) = mpsc::channel::<Task>(100);
@@ -122,7 +122,8 @@ impl RateLimiter {
 				.await
 				.expect("Failed to acquire semaphore permit. Did the semaphore close?");
 
-			// New permit will be added again after the task is finished
+			// Permit is released manually inside the spawned task after the
+			// task body and the rate-limit interval have both elapsed.
 			permit.forget();
 
 			// Only dequeue once a slot is free, so the biased select can
@@ -138,8 +139,7 @@ impl RateLimiter {
 			let counter = queue_size.clone();
 			let sender = retry_sender.clone();
 
-			// Run task itself on separate thread so we can immediately
-			// wait for new tasks
+			// Spawn the task so the loop can immediately acquire the next permit.
 			tokio::spawn(async move {
 				let result = task().await;
 
@@ -149,7 +149,7 @@ impl RateLimiter {
 				semaphore.add_permits(1);
 
 				match result {
-					TaskResult::Success => {
+					TaskResult::Done => {
 						counter.fetch_sub(1, Ordering::Relaxed);
 					}
 					// Re-enqueue to the retry channel, which is always drained
@@ -187,13 +187,13 @@ impl RateLimiter {
 		// Wrap the one-shot future so it fits the retryable Task type.
 		// The Mutex<Option<_>> lets us move the future into an Arc<Fn()> without
 		// requiring Fn to own it multiple times; take() is called exactly once
-		// because this task always returns Success.
+		// because this task always returns Done.
 		let fut = std::sync::Mutex::new(Some(fut));
 		let task: Task = Arc::new(move || {
 			let f = fut.lock().unwrap().take().expect("task already consumed");
 			Box::pin(async move {
 				f.await;
-				TaskResult::Success
+				TaskResult::Done
 			}) as Pin<Box<dyn Future<Output = TaskResult> + Send>>
 		});
 
@@ -231,7 +231,7 @@ impl RateLimiter {
 	/// # let rate_limiter = RateLimiter::new(1, Duration::from_secs(1)).unwrap();
 	/// rate_limiter.schedule_task_with_retry(|| async {
 	///     match do_api_call().await {
-	///         Ok(_)  => TaskResult::Success,
+	///         Ok(_)  => TaskResult::Done,
 	///         Err(_) => TaskResult::TryAgain,
 	///     }
 	/// }).await;
@@ -291,7 +291,6 @@ mod tests {
 
 		tokio::time::pause();
 
-		// Task 1
 		rate_limiter
 			.schedule_task(async move {
 				*task_1_status.clone().lock_owned().await = 1;
@@ -302,7 +301,6 @@ mod tests {
 			})
 			.await;
 
-		// Task 2
 		rate_limiter
 			.schedule_task(async move {
 				*task_2_status.clone().lock_owned().await = 1;
@@ -313,7 +311,6 @@ mod tests {
 			})
 			.await;
 
-		// Task 3
 		rate_limiter
 			.schedule_task(async move {
 				*task_3_status.clone().lock_owned().await = 1;
@@ -631,7 +628,6 @@ mod tests {
 
 		tokio::time::pause();
 
-		// Task 1
 		rate_limiter
 			.schedule_task(async move {
 				*task_1_status.clone().lock_owned().await = 1;
@@ -642,7 +638,6 @@ mod tests {
 			})
 			.await;
 
-		// Task 2
 		rate_limiter
 			.schedule_task(async move {
 				*task_2_status.clone().lock_owned().await = 1;
@@ -653,7 +648,6 @@ mod tests {
 			})
 			.await;
 
-		// Task 3
 		rate_limiter
 			.schedule_task(async move {
 				*task_3_status.clone().lock_owned().await = 1;
@@ -905,7 +899,6 @@ mod tests {
 
 		tokio::time::pause();
 
-		// Task 1
 		rate_limiter
 			.schedule_task(async move {
 				*task_1_status.clone().lock_owned().await = 1;
@@ -914,7 +907,6 @@ mod tests {
 			})
 			.await;
 
-		// Task 2
 		rate_limiter
 			.schedule_task(async move {
 				*task_2_status.clone().lock_owned().await = 1;
@@ -923,7 +915,6 @@ mod tests {
 			})
 			.await;
 
-		// Task 3
 		rate_limiter
 			.schedule_task(async move {
 				*task_3_status.clone().lock_owned().await = 1;
@@ -932,7 +923,6 @@ mod tests {
 			})
 			.await;
 
-		// Task 4
 		rate_limiter
 			.schedule_task(async move {
 				*task_4_status.clone().lock_owned().await = 1;
@@ -941,7 +931,6 @@ mod tests {
 			})
 			.await;
 
-		// Task 5
 		rate_limiter
 			.schedule_task(async move {
 				*task_5_status.clone().lock_owned().await = 1;
@@ -950,7 +939,6 @@ mod tests {
 			})
 			.await;
 
-		// Task 6
 		rate_limiter
 			.schedule_task(async move {
 				*task_6_status.clone().lock_owned().await = 1;
@@ -1294,8 +1282,8 @@ mod tests {
 		);
 	}
 
-	// Each helper creates the standard "attempt counter + succeeded flag" shared
-	// state used across the retry tests.
+	// Creates the shared attempt-counter + succeeded-flag state used across
+	// retry tests.
 	fn make_retry_state() -> (
 		Arc<Mutex<u32>>,
 		Arc<Mutex<u32>>,
@@ -1310,7 +1298,7 @@ mod tests {
 	}
 
 	/// Verifies that a task that keeps returning TryAgain is re-run after each
-	/// rate-limit interval and eventually completes once it returns Success.
+	/// rate-limit interval and eventually completes once it returns Done.
 	#[tokio::test]
 	async fn test_retry_reruns_task() {
 		let rate_limiter = RateLimiter::new(1, Duration::from_millis(100)).unwrap();
@@ -1318,7 +1306,7 @@ mod tests {
 
 		tokio::time::pause();
 
-		// TryAgain on attempts 1 and 2, Success on attempt 3
+		// TryAgain on attempts 1 and 2, Done on attempt 3
 		rate_limiter
 			.schedule_task_with_retry(move || {
 				let attempts = attempts.clone();
@@ -1330,7 +1318,7 @@ mod tests {
 						TaskResult::TryAgain
 					} else {
 						*succeeded.lock().await = true;
-						TaskResult::Success
+						TaskResult::Done
 					}
 				}
 			})
@@ -1351,7 +1339,91 @@ mod tests {
 		tokio::time::advance(Duration::from_millis(101)).await;
 		tokio::task::yield_now().await;
 		assert_eq!(*attempts_check.lock().await, 3, "third attempt should have run");
-		assert!(*succeeded_check.lock().await, "task should have succeeded on attempt 3");
+		assert!(*succeeded_check.lock().await, "task should have returned Done on attempt 3");
+	}
+
+	/// Done on the very first attempt must stop the task without triggering a retry.
+	#[tokio::test]
+	async fn test_done_stops_immediately() {
+		let rate_limiter = RateLimiter::new(1, Duration::from_millis(100)).unwrap();
+		let (attempts, attempts_check, _, _) = make_retry_state();
+
+		tokio::time::pause();
+
+		rate_limiter
+			.schedule_task_with_retry(move || {
+				let attempts = attempts.clone();
+				async move {
+					*attempts.lock().await += 1;
+					TaskResult::Done
+				}
+			})
+			.await;
+
+		tokio::task::yield_now().await;
+		assert_eq!(
+			*attempts_check.lock().await,
+			1,
+			"task should have run exactly once"
+		);
+
+		// Advance past the interval and confirm no retry occurred
+		tokio::time::advance(Duration::from_millis(101)).await;
+		tokio::task::yield_now().await;
+		assert_eq!(
+			*attempts_check.lock().await,
+			1,
+			"Done must not trigger a retry"
+		);
+	}
+
+	/// Done after several TryAgain returns must stop the task at that point.
+	#[tokio::test]
+	async fn test_try_again_then_done() {
+		let rate_limiter = RateLimiter::new(1, Duration::from_millis(100)).unwrap();
+		let (attempts, attempts_check, _, _) = make_retry_state();
+
+		tokio::time::pause();
+
+		// TryAgain on attempts 1 and 2, Done on attempt 3
+		rate_limiter
+			.schedule_task_with_retry(move || {
+				let attempts = attempts.clone();
+				async move {
+					let mut n = attempts.lock().await;
+					*n += 1;
+					if *n < 3 {
+						TaskResult::TryAgain
+					} else {
+						TaskResult::Done
+					}
+				}
+			})
+			.await;
+
+		tokio::task::yield_now().await;
+		assert_eq!(*attempts_check.lock().await, 1, "first attempt should have run");
+
+		tokio::time::advance(Duration::from_millis(101)).await;
+		tokio::task::yield_now().await;
+		assert_eq!(*attempts_check.lock().await, 2, "second attempt should have run");
+
+		tokio::time::advance(Duration::from_millis(101)).await;
+		tokio::task::yield_now().await;
+		assert_eq!(
+			*attempts_check.lock().await,
+			3,
+			"third attempt should have run and returned Done"
+		);
+
+		// Done on attempt 3 must not trigger another retry
+		tokio::time::advance(Duration::from_millis(101)).await;
+		tokio::task::yield_now().await;
+		assert_eq!(
+			*attempts_check.lock().await,
+			3,
+			"no further retry after Done"
+		);
 	}
 
 	/// Verifies that a retried task takes priority over a newly scheduled task
@@ -1366,7 +1438,7 @@ mod tests {
 
 		tokio::time::pause();
 
-		// Task A: TryAgain on first attempt, Success on second
+		// Task A: TryAgain on first attempt, Done on second
 		rate_limiter
 			.schedule_task_with_retry({
 				let attempts = task_a_attempts.clone();
@@ -1378,7 +1450,7 @@ mod tests {
 						if *n == 1 {
 							TaskResult::TryAgain
 						} else {
-							TaskResult::Success
+							TaskResult::Done
 						}
 					}
 				}
@@ -1414,5 +1486,65 @@ mod tests {
 		tokio::time::advance(Duration::from_millis(1001)).await;
 		tokio::task::yield_now().await;
 		assert!(*task_b_started_check.lock().await, "B should now have started");
+	}
+
+	/// With per_time = 0 the interval sleep fires at Instant::now() so there
+	/// is no enforced wait between tasks. All tasks must complete well within
+	/// a time window that a non-zero per_time would have prevented.
+	#[tokio::test]
+	async fn test_zero_per_time() {
+		// Do NOT pause time: sleep(Duration::ZERO) fires at Instant::now().
+		// A brief real-time sleep is needed so the event loop can process the
+		// instant timers — yield_now alone does not trigger I/O/timer polling.
+		let rate_limiter = RateLimiter::new(1, Duration::ZERO).unwrap();
+
+		let ran = Arc::new(Mutex::new(0u32));
+		let start = std::time::Instant::now();
+
+		for _ in 0..3 {
+			let ran = ran.clone();
+			rate_limiter
+				.schedule_task(async move {
+					*ran.lock().await += 1;
+				})
+				.await;
+		}
+
+		// Allow the event loop to drain the instant timers.
+		tokio::time::sleep(Duration::from_millis(100)).await;
+
+		assert_eq!(*ran.lock().await, 3, "All 3 tasks must run");
+		assert!(
+			start.elapsed() < Duration::from_secs(1),
+			"Tasks must not be rate-limited when per_time=0 (elapsed: {:?})",
+			start.elapsed()
+		);
+	}
+
+	/// `schedule_task_with_retry` increments the same queue-depth counter as
+	/// `schedule_task`, so the ETA estimate must account for both.
+	#[tokio::test]
+	async fn test_eta_includes_retry_tasks() {
+		let rate_limiter = RateLimiter::new(2, Duration::from_secs(1)).unwrap();
+
+		tokio::time::pause();
+
+		// Retryable task takes position 0 in the shared counter
+		let eta_a = rate_limiter
+			.schedule_task_with_retry(|| async { TaskResult::Done })
+			.await;
+		assert_eq!(eta_a, Duration::ZERO, "First retryable task has no queue ahead");
+
+		// Plain task takes position 1 — still within the first burst window
+		let eta_b = rate_limiter.schedule_task(async {}).await;
+		assert_eq!(eta_b, Duration::ZERO, "Second task is in the same burst window");
+
+		// Third task overflows the burst window regardless of its type
+		let eta_c = rate_limiter.schedule_task(async {}).await;
+		assert_eq!(
+			eta_c,
+			Duration::from_secs(1),
+			"Third task must wait one full window"
+		);
 	}
 }

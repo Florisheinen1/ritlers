@@ -32,9 +32,12 @@
 //!
 //! // Schedule a task that retries on rate-limit errors
 //! limiter.schedule_task_with_retry(|| {
-//!     // Return TryAgain to re-queue at the next available slot
-//!     TaskResult::Success
+//!     match do_api_call() {
+//!         Ok(_)  => TaskResult::Done,
+//!         Err(_) => TaskResult::TryAgain,
+//!     }
 //! });
+//! # fn do_api_call() -> Result<(), ()> { Ok(()) }
 //! ```
 //!
 //! ## Async
@@ -53,9 +56,12 @@
 //!
 //! // Schedule a task that retries on rate-limit errors
 //! limiter.schedule_task_with_retry(|| async {
-//!     // Return TryAgain to re-queue at the next available slot
-//!     TaskResult::Success
+//!     match do_api_call().await {
+//!         Ok(_)  => TaskResult::Done,
+//!         Err(_) => TaskResult::TryAgain,
+//!     }
 //! }).await;
+//! # async fn do_api_call() -> Result<(), ()> { Ok(()) }
 //! # }
 //! ```
 
@@ -71,10 +77,25 @@ pub mod async_rt;
 /// When [`TryAgain`](TaskResult::TryAgain) is returned, the task is
 /// re-queued and will run again as soon as the next rate-limit slot is free.
 /// Retried tasks are prioritised over newly scheduled tasks.
-#[derive(Debug, PartialEq, Eq)]
+/// When [`Done`](TaskResult::Done) is returned, the task stops retrying
+/// and the slot is released.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskResult {
-	/// The task completed successfully; release the slot.
-	Success,
+	/// The task is done (successfully or not); release the slot.
+	Done,
 	/// The task should be retried at the next available slot.
 	TryAgain,
 }
+
+/// Error returned by [`blocking::RateLimiter::new`] and
+/// [`async_rt::RateLimiter::new`] when `amount` is zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ZeroAmountError;
+
+impl std::fmt::Display for ZeroAmountError {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.write_str("amount must be greater than zero")
+	}
+}
+
+impl std::error::Error for ZeroAmountError {}

@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use crate::TaskResult;
+use crate::{TaskResult, ZeroAmountError};
 
 /// A synchronous, task-length aware rate limiter.
 ///
@@ -29,7 +29,7 @@ impl RateLimiter {
 	///
 	/// # Errors
 	///
-	/// Returns `Err(())` if `amount` is zero.
+	/// Returns [`Err(ZeroAmountError)`](ZeroAmountError) if `amount` is zero.
 	///
 	/// # Example
 	///
@@ -39,9 +39,9 @@ impl RateLimiter {
 	///
 	/// let limiter = RateLimiter::new(5, Duration::from_secs(1)).unwrap();
 	/// ```
-	pub fn new(amount: usize, per_time: Duration) -> Result<Self, ()> {
+	pub fn new(amount: usize, per_time: Duration) -> Result<Self, ZeroAmountError> {
 		if amount == 0 {
-			return Err(());
+			return Err(ZeroAmountError);
 		}
 		Ok(Self {
 			finish_times: vec![Instant::now(); amount],
@@ -85,13 +85,13 @@ impl RateLimiter {
 	}
 
 	/// Runs the given task, retrying it after each rate-limit interval until it
-	/// returns [`TaskResult::Success`].
+	/// returns [`TaskResult::Done`].
 	///
 	/// Each attempt — including retries — must wait for an available slot, so
 	/// the rate limit is respected throughout. Blocks the calling thread until
-	/// the task succeeds.
+	/// the task is done.
 	///
-	/// Returns the [`Instant`] when the final successful attempt finished.
+	/// Returns the [`Instant`] when the final attempt finished.
 	///
 	/// # Example
 	///
@@ -101,7 +101,7 @@ impl RateLimiter {
 	/// # let mut rate_limiter = RateLimiter::new(1, Duration::from_secs(1)).unwrap();
 	/// rate_limiter.schedule_task_with_retry(|| {
 	///     match do_api_call() {
-	///         Ok(_)  => TaskResult::Success,
+	///         Ok(_)  => TaskResult::Done,
 	///         Err(_) => TaskResult::TryAgain,
 	///     }
 	/// });
@@ -126,7 +126,7 @@ impl RateLimiter {
 			self.finish_times.insert(0, finished_at);
 
 			match result {
-				TaskResult::Success => return finished_at,
+				TaskResult::Done => return finished_at,
 				TaskResult::TryAgain => continue,
 			}
 		}
@@ -220,11 +220,117 @@ mod tests {
 			if attempts.get() < 3 {
 				TaskResult::TryAgain
 			} else {
-				TaskResult::Success
+				TaskResult::Done
 			}
 		});
 
-		assert_eq!(attempts.get(), 3, "Should have attempted 3 times (2 retries)");
+		assert_eq!(
+			attempts.get(),
+			3,
+			"Should have attempted 3 times (2 retries)"
+		);
 		assert!(finished <= Instant::now());
+	}
+
+	/// Done on the very first attempt must stop the loop without retrying.
+	#[test]
+	fn test_done_stops_immediately() {
+		let mut rate_limiter = RateLimiter::new(1, Duration::from_millis(50)).unwrap();
+
+		let attempts = std::cell::Cell::new(0u32);
+		rate_limiter.schedule_task_with_retry(|| {
+			attempts.set(attempts.get() + 1);
+			TaskResult::Done
+		});
+
+		assert_eq!(
+			attempts.get(),
+			1,
+			"Done should stop after a single attempt without retrying"
+		);
+	}
+
+	/// With per_time = 0 there is no enforced wait between tasks, so many
+	/// tasks should complete near-instantly with no sleeping.
+	#[test]
+	fn test_zero_per_time() {
+		let mut rate_limiter = RateLimiter::new(1, Duration::ZERO).unwrap();
+
+		let start = Instant::now();
+		for _ in 0..5 {
+			rate_limiter.schedule_task(|| {});
+		}
+		assert!(
+			start.elapsed() < Duration::from_millis(200),
+			"Tasks with per_time=0 should complete without enforced delays"
+		);
+	}
+
+	/// Retries must respect the same rate-limit interval as plain tasks — they
+	/// are not allowed to run back-to-back without waiting for a slot.
+	#[test]
+	fn test_retry_is_rate_limited() {
+		let mut rate_limiter = RateLimiter::new(1, Duration::from_millis(100)).unwrap();
+
+		let finish_times = std::cell::RefCell::new(Vec::<Instant>::new());
+		rate_limiter.schedule_task_with_retry(|| {
+			finish_times.borrow_mut().push(Instant::now());
+			if finish_times.borrow().len() < 3 {
+				TaskResult::TryAgain
+			} else {
+				TaskResult::Done
+			}
+		});
+
+		let times = finish_times.borrow();
+		assert_eq!(times.len(), 3);
+		assert!(
+			times[1].duration_since(times[0]) >= Duration::from_millis(100),
+			"Second attempt should be at least one interval after the first"
+		);
+		assert!(
+			times[2].duration_since(times[1]) >= Duration::from_millis(100),
+			"Third attempt should be at least one interval after the second"
+		);
+	}
+
+	/// The internal `finish_times` vec must always hold exactly `amount`
+	/// entries — never more, never fewer — regardless of how many tasks run.
+	#[test]
+	fn test_finish_times_count_stays_constant() {
+		let amount = 3;
+		let mut rate_limiter = RateLimiter::new(amount, Duration::ZERO).unwrap();
+
+		assert_eq!(rate_limiter.finish_times.len(), amount);
+		for _ in 0..5 {
+			rate_limiter.schedule_task(|| {});
+			assert_eq!(
+				rate_limiter.finish_times.len(),
+				amount,
+				"finish_times length must stay equal to amount after each task"
+			);
+		}
+	}
+
+	/// Done after several TryAgain returns must stop the loop at that point.
+	#[test]
+	fn test_try_again_then_done() {
+		let mut rate_limiter = RateLimiter::new(1, Duration::from_millis(50)).unwrap();
+
+		let attempts = std::cell::Cell::new(0u32);
+		rate_limiter.schedule_task_with_retry(|| {
+			attempts.set(attempts.get() + 1);
+			if attempts.get() < 3 {
+				TaskResult::TryAgain
+			} else {
+				TaskResult::Done
+			}
+		});
+
+		assert_eq!(
+			attempts.get(),
+			3,
+			"Should have run 3 times (2 TryAgain retries) before stopping on Done"
+		);
 	}
 }

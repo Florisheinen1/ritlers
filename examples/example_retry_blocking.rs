@@ -15,6 +15,7 @@ fn simulated_api_call(attempt: u32) -> Result<String, String> {
 fn main() {
 	// 2 requests per second
 	let mut rate_limiter = RateLimiter::new(2, Duration::from_secs(1)).unwrap();
+	let start = std::time::Instant::now();
 
 	// Each task gets its own retry budget of 3 attempts.
 	// The closure is FnMut, so the counter can live on the stack.
@@ -22,13 +23,13 @@ fn main() {
 		let mut retries_remaining = 3u32;
 		let mut attempt = 0u32;
 
-		rate_limiter.schedule_task_with_retry(|| {
+		let done = rate_limiter.schedule_task_with_retry(|| {
 			attempt += 1;
 
 			match simulated_api_call(attempt) {
 				Ok(response) => {
 					println!("[task {task_id}] {response}");
-					TaskResult::Success
+					TaskResult::Done
 				}
 				Err(e) if retries_remaining > 0 => {
 					retries_remaining -= 1;
@@ -37,9 +38,10 @@ fn main() {
 				}
 				Err(e) => {
 					println!("[task {task_id}] {e} — giving up");
-					TaskResult::Success
+					TaskResult::Done
 				}
 			}
 		});
+		println!("[task {task_id}] finished at +{:.2?}", done.duration_since(start));
 	}
 }
