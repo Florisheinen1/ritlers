@@ -33,6 +33,7 @@ pub struct RateLimiter {
 	queued_tasks: Arc<AtomicUsize>,
 	amount: usize,
 	per_time: Duration,
+	retry_queue_sender: mpsc::Sender<Task>,
 }
 
 impl RateLimiter {
@@ -55,16 +56,18 @@ impl RateLimiter {
 		let semaphore = Arc::new(Semaphore::new(amount));
 
 		let (sender, receiver) = mpsc::channel::<Task>(100);
+		let (retry_sender, retry_receiver) = mpsc::channel::<Task>(100);
 
 		// Keep track of the size of the queue for ETA calculations
 		let queue_size = Arc::new(AtomicUsize::new(0));
 		let queue_size_upper = queue_size.clone();
 
-		let sender_for_retry = sender.clone();
+		let retry_sender_for_tasks = retry_sender.clone();
 		tokio::spawn(async move {
 			Self::run_tasks(
 				receiver,
-				sender_for_retry,
+				retry_receiver,
+				retry_sender_for_tasks,
 				semaphore,
 				per_time,
 				queue_size_upper,
@@ -77,6 +80,7 @@ impl RateLimiter {
 			queued_tasks: queue_size,
 			amount,
 			per_time,
+			retry_queue_sender: retry_sender,
 		})
 	}
 
@@ -84,16 +88,20 @@ impl RateLimiter {
 	/// Thread blocking and runs indefinitely
 	async fn run_tasks(
 		mut task_receiver: mpsc::Receiver<Task>,
-		task_sender: mpsc::Sender<Task>,
+		mut retry_receiver: mpsc::Receiver<Task>,
+		retry_sender: mpsc::Sender<Task>,
 		semaphore: Arc<Semaphore>,
 		interval: Duration,
 		queue_size: Arc<AtomicUsize>,
 	) -> ! {
 		loop {
-			let task = task_receiver
-				.recv()
-				.await
-				.expect("Failed to read task queue. Did the channel close?");
+			// Prefer retried tasks over newly scheduled ones so they jump the queue
+			let task = tokio::select! {
+				biased;
+				Some(t) = retry_receiver.recv() => t,
+				Some(t) = task_receiver.recv() => t,
+				else => panic!("Task queue closed unexpectedly"),
+			};
 
 			let permit = semaphore
 				.acquire()
@@ -105,7 +113,7 @@ impl RateLimiter {
 
 			let semaphore = semaphore.clone();
 			let counter = queue_size.clone();
-			let sender = task_sender.clone();
+			let sender = retry_sender.clone();
 
 			// Run task itself on separate thread so we can immediately
 			// wait for new tasks
@@ -121,8 +129,8 @@ impl RateLimiter {
 					TaskResult::Success => {
 						counter.fetch_sub(1, Ordering::Relaxed);
 					}
-					// Re-enqueue the task at the back of the queue so it runs
-					// again as soon as a slot is available
+					// Re-enqueue to the retry channel, which is always drained
+					// before the normal task channel
 					TaskResult::TryAgain => {
 						let _ = sender.send(task).await;
 					}
