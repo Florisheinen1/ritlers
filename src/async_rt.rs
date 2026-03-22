@@ -13,7 +13,9 @@ use tokio::{
 	time::sleep,
 };
 
-type Task = Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>;
+use crate::TaskResult;
+
+type Task = Arc<dyn Fn() -> Pin<Box<dyn Future<Output = TaskResult> + Send>> + Send + Sync>;
 
 /// Task-length aware rate limiter
 ///
@@ -58,8 +60,16 @@ impl RateLimiter {
 		let queue_size = Arc::new(AtomicUsize::new(0));
 		let queue_size_upper = queue_size.clone();
 
+		let sender_for_retry = sender.clone();
 		tokio::spawn(async move {
-			Self::run_tasks(receiver, semaphore, per_time, queue_size_upper).await;
+			Self::run_tasks(
+				receiver,
+				sender_for_retry,
+				semaphore,
+				per_time,
+				queue_size_upper,
+			)
+			.await;
 		});
 
 		Ok(Self {
@@ -74,6 +84,7 @@ impl RateLimiter {
 	/// Thread blocking and runs indefinitely
 	async fn run_tasks(
 		mut task_receiver: mpsc::Receiver<Task>,
+		task_sender: mpsc::Sender<Task>,
 		semaphore: Arc<Semaphore>,
 		interval: Duration,
 		queue_size: Arc<AtomicUsize>,
@@ -94,18 +105,28 @@ impl RateLimiter {
 
 			let semaphore = semaphore.clone();
 			let counter = queue_size.clone();
+			let sender = task_sender.clone();
 
 			// Run task itself on separate thread so we can immediately
 			// wait for new tasks
 			tokio::spawn(async move {
-				task().await;
+				let result = task().await;
 
 				// Sleep for `interval` time before adding a permit to ensure the
 				// rate limit is adhered to
 				sleep(interval).await;
 				semaphore.add_permits(1);
 
-				counter.fetch_sub(1, Ordering::Relaxed);
+				match result {
+					TaskResult::Success => {
+						counter.fetch_sub(1, Ordering::Relaxed);
+					}
+					// Re-enqueue the task at the back of the queue so it runs
+					// again as soon as a slot is available
+					TaskResult::TryAgain => {
+						let _ = sender.send(task).await;
+					}
+				}
 			});
 		}
 	}
@@ -126,8 +147,18 @@ impl RateLimiter {
 	where
 		Fut: Future<Output = ()> + Send + 'static,
 	{
-		let task: Task =
-			Box::new(move || Box::pin(fut) as Pin<Box<dyn Future<Output = ()> + Send>>);
+		// Wrap the one-shot future so it fits the retryable Task type.
+		// The Mutex<Option<_>> lets us move the future into an Arc<Fn()> without
+		// requiring Fn to own it multiple times; take() is called exactly once
+		// because this task always returns Success.
+		let fut = std::sync::Mutex::new(Some(fut));
+		let task: Task = Arc::new(move || {
+			let f = fut.lock().unwrap().take().expect("task already consumed");
+			Box::pin(async move {
+				f.await;
+				TaskResult::Success
+			}) as Pin<Box<dyn Future<Output = TaskResult> + Send>>
+		});
 
 		self.task_queue_sender
 			.send(task)
@@ -138,9 +169,47 @@ impl RateLimiter {
 
 		let batches_ahead = position_in_queue / self.amount;
 
-		let estimated_waiting_time = self.per_time * batches_ahead as u32;
+		self.per_time * batches_ahead as u32
+	}
 
-		return estimated_waiting_time;
+	/// Schedules a retryable task using a factory closure. \
+	/// The factory is called each time the task runs. If it returns
+	/// [`TaskResult::TryAgain`], the task is re-queued and will run again
+	/// as soon as the next rate-limit slot is available. \
+	/// Returns the estimated time until the first attempt starts.
+	///
+	/// # Example
+	///
+	/// ```rs
+	/// rate_limiter.schedule_task_with_retry(|| async {
+	/// 	match api_call().await {
+	/// 		Ok(_) => TaskResult::Success,
+	/// 		Err(ApiError::RateLimit) => TaskResult::TryAgain,
+	/// 	}
+	/// }).await;
+	/// ```
+	pub async fn schedule_task_with_retry<F, Fut>(&self, factory: F) -> Duration
+	where
+		F: Fn() -> Fut + Send + Sync + 'static,
+		Fut: Future<Output = TaskResult> + Send + 'static,
+	{
+		let factory = Arc::new(factory);
+		let task: Task = Arc::new(move || {
+			let factory = factory.clone();
+			Box::pin(async move { factory().await })
+				as Pin<Box<dyn Future<Output = TaskResult> + Send>>
+		});
+
+		self.task_queue_sender
+			.send(task)
+			.await
+			.expect("Failed to schedule task. Did the channel close?");
+
+		let position_in_queue = self.queued_tasks.fetch_add(1, Ordering::Relaxed);
+
+		let batches_ahead = position_in_queue / self.amount;
+
+		self.per_time * batches_ahead as u32
 	}
 }
 
@@ -1173,5 +1242,40 @@ mod tests {
 			Duration::from_secs(3),
 			"Fourth task should start after at least 3 seconds"
 		);
+	}
+
+	#[tokio::test]
+	async fn test_retry() {
+		let rate_limiter = RateLimiter::new(1, Duration::from_millis(50)).unwrap();
+		let attempt_count = Arc::new(AtomicUsize::new(0));
+		let attempt_count_check = attempt_count.clone();
+		let succeeded = Arc::new(Mutex::new(false));
+		let succeeded_check = succeeded.clone();
+
+		rate_limiter
+			.schedule_task_with_retry(move || {
+				let count = attempt_count.clone();
+				let succeeded = succeeded.clone();
+				async move {
+					let n = count.fetch_add(1, Ordering::Relaxed) + 1;
+					if n < 3 {
+						TaskResult::TryAgain
+					} else {
+						*succeeded.lock().await = true;
+						TaskResult::Success
+					}
+				}
+			})
+			.await;
+
+		// Allow all retry attempts to complete (3 attempts * 50ms interval)
+		tokio::time::sleep(Duration::from_millis(300)).await;
+
+		assert_eq!(
+			attempt_count_check.load(Ordering::Relaxed),
+			3,
+			"Should have attempted 3 times (2 retries)"
+		);
+		assert!(*succeeded_check.lock().await, "Task should have succeeded");
 	}
 }

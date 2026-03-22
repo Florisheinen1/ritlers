@@ -13,3 +13,12 @@ pub mod blocking;
 
 #[cfg(feature = "async")]
 pub mod async_rt;
+
+/// The result of a retryable task.
+///
+/// Return `TryAgain` from a task passed to `schedule_task_with_retry` to have
+/// the rate limiter re-schedule the task as soon as the next slot is available.
+pub enum TaskResult {
+	Success,
+	TryAgain,
+}

@@ -1,5 +1,7 @@
 use std::time::{Duration, Instant};
 
+use crate::TaskResult;
+
 pub struct RateLimiter {
 	finish_times: Vec<Instant>, // Sorted (old -> recent) list of finish times
 	per_time: Duration,
@@ -39,6 +41,34 @@ impl RateLimiter {
 		self.finish_times.insert(0, finished_at);
 		finished_at
 	}
+	/// Runs the given task, retrying it (respecting the rate limit each time)
+	/// until the task returns [`TaskResult::Success`].
+	/// Blocks the calling thread until the task succeeds.
+	/// Returns the instant when the final (successful) attempt finished.
+	pub fn schedule_task_with_retry<F>(&mut self, mut task: F) -> Instant
+	where
+		F: FnMut() -> TaskResult,
+	{
+		loop {
+			let oldest_finish_time = self.finish_times.pop().expect("At least one finish time");
+
+			let now = Instant::now();
+
+			let wait_until = oldest_finish_time + self.per_time;
+			let time_to_wait = wait_until.duration_since(now);
+			std::thread::sleep(time_to_wait);
+
+			let result = task();
+
+			let finished_at = Instant::now();
+			self.finish_times.insert(0, finished_at);
+
+			match result {
+				TaskResult::Success => return finished_at,
+				TaskResult::TryAgain => continue,
+			}
+		}
+	}
 }
 
 #[cfg(test)]
@@ -46,6 +76,7 @@ mod tests {
 
 	use std::time::{Duration, Instant};
 
+	use crate::TaskResult;
 	use crate::blocking::RateLimiter;
 
 	#[test]
@@ -117,5 +148,23 @@ mod tests {
 		assert!(finished_3.duration_since(finished_1) < Duration::from_secs(1));
 		// Task 4 however needs to wait for the time to elapse since task 1
 		assert!(finished_1 + Duration::from_secs(1) < finished_4);
+	}
+
+	#[test]
+	fn test_retry() {
+		let mut rate_limiter = RateLimiter::new(1, Duration::from_millis(50)).unwrap();
+
+		let attempts = std::cell::Cell::new(0u32);
+		let finished = rate_limiter.schedule_task_with_retry(|| {
+			attempts.set(attempts.get() + 1);
+			if attempts.get() < 3 {
+				TaskResult::TryAgain
+			} else {
+				TaskResult::Success
+			}
+		});
+
+		assert_eq!(attempts.get(), 3, "Should have attempted 3 times (2 retries)");
+		assert!(finished <= Instant::now());
 	}
 }
